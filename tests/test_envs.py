@@ -55,6 +55,12 @@ def test_ple_placement_rejects_unknown_value(monkeypatch: pytest.MonkeyPatch):
         _ = envs.VLLM_PLE_PLACEMENT
 
 
+@pytest.mark.parametrize(("value", "expected"), [("1", True), ("true", True), ("0", False)])
+def test_force_nvfp4_w4a16(monkeypatch: pytest.MonkeyPatch, value: str, expected: bool):
+    monkeypatch.setenv("VLLM_FORCE_NVFP4_W4A16", value)
+    assert envs.VLLM_FORCE_NVFP4_W4A16 is expected
+
+
 def test_nixl_side_channel_host_is_not_compile_factor(
     monkeypatch: pytest.MonkeyPatch,
 ):
