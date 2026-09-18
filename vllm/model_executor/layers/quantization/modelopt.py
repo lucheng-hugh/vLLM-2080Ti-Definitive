@@ -726,6 +726,12 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
     ) -> None:
         if exclude_modules is None:
             exclude_modules = []
+        if quant_method == "NVFP4" and envs.VLLM_FORCE_NVFP4_W4A16:
+            logger.warning_once(
+                "VLLM_FORCE_NVFP4_W4A16=1: loading ModelOpt NVFP4 weights "
+                "through the Marlin W4A16 fallback."
+            )
+            quant_method = "W4A16_NVFP4"
         super().__init__(exclude_modules)
         self.quant_method = quant_method
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
