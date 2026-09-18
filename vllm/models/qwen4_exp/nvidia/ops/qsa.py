@@ -515,6 +515,7 @@ def _select_config(
     use_prefill_config: bool,
     num_columns: int,
     is_fp8: bool = False,
+    is_pre_ampere: bool = False,
 ) -> tuple[int, int, int, int]:
     """Select (block_n, num_warps, num_tiles, num_splits) for the kernel.
 
@@ -569,7 +570,7 @@ def qsa_sparse_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     *,
-    output_gate: torch.Tensor,
+    output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 or FP8-e4m3 K/V caches.
 
@@ -624,6 +625,8 @@ def qsa_sparse_paged_attention(
 
     if out is None:
         out = torch.empty_like(q)
+    if output_gate is None:
+        output_gate = torch.full_like(q, 20)
     if out.shape != q.shape:
         raise ValueError("QSA sparse output must match its query")
     assert out.dtype == q.dtype and out.device == q.device
@@ -641,7 +644,12 @@ def qsa_sparse_paged_attention(
     )
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
     block_n, partial_warps, num_tiles, num_splits = _select_config(
-        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
+        q.shape[0],
+        k_cache.shape[2],
+        use_prefill_config,
+        selection_width,
+        is_fp8,
+        is_pre_ampere,
     )
 
     # Split=1 writes output directly and compiles out all workspace accesses.
@@ -754,7 +762,12 @@ def warmup_qsa_sparse_paged_attention(
     # Every config the dispatch can pick for this group size.
     profiles = {
         _select_config(
-            num_rows, num_kv_heads, use_prefill_config, selection_width, is_fp8
+            num_rows,
+            num_kv_heads,
+            use_prefill_config,
+            selection_width,
+            is_fp8,
+            is_pre_ampere,
         )
         for num_rows in range(1, 8193)
         for use_prefill_config in (False, True)

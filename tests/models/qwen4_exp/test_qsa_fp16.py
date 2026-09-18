@@ -51,6 +51,7 @@ def test_qsa_sparse_paged_attention_fp16_matches_reference() -> None:
         block_table,
         token_to_req,
         use_prefill_config=False,
+        output_gate=torch.full_like(query, 20),
     )
 
     expected = torch.empty_like(actual)
