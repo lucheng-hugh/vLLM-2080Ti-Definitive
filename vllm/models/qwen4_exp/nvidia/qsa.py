@@ -63,7 +63,7 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
 class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     """FullAttentionSpec backend used by the merged QSA owner."""
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     # fp8/fp8_e4m3: e4m3 bytes in a uint8 cache, written by reshape_and_cache
     # with the layer's per-tensor scales and dequantized on load inside the QSA
     # Triton kernel. flash-attn never runs over this cache, so its fp8 probe
@@ -220,7 +220,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             # other host-scale backends; folded into the kernel's scales.
             k_scale = layer._k_scale_float
             v_scale = layer._v_scale_float
-        if query.dtype != torch.bfloat16 or key_cache.dtype not in (
+        if query.dtype not in (torch.float16, torch.bfloat16) or key_cache.dtype not in (
+            torch.float16,
             torch.bfloat16,
             torch.float8_e4m3fn,
         ):
@@ -266,8 +267,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         model_config = vllm_config.model_config
         if cache_config is None:
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
-        if model_config.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
+        if model_config.dtype not in (torch.float16, torch.bfloat16):
+            raise NotImplementedError("Qwen4Exp QSA requires FP16 or BF16")
         if cache_config.cache_dtype not in (
             "auto",
             "bfloat16",

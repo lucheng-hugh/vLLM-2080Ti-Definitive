@@ -600,7 +600,7 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == torch.bfloat16
+    assert q.dtype in (torch.float16, torch.bfloat16)
     assert k_cache.dtype == v_cache.dtype
     is_fp8 = k_cache.dtype == torch.float8_e4m3fn
     if is_fp8:
@@ -766,7 +766,8 @@ def warmup_qsa_sparse_paged_attention(
     num_rows = 16
     num_requests = 16
     q_ptr = TritonWarmupTensor(
-        torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
+        cache_dtype if not is_fp8 else torch.float16,
+        shape=(num_rows, num_query_heads, head_dim),
     )
     k_cache_ptr = TritonWarmupTensor(
         cache_dtype,
@@ -787,11 +788,11 @@ def warmup_qsa_sparse_paged_attention(
     )
     token_to_req_ptr = TritonWarmupTensor(torch.int32)
     output_ptr = TritonWarmupTensor(
-        torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
+        q_ptr.dtype, shape=(num_rows, num_query_heads, head_dim)
     )
     # The output gate is mandatory at runtime; warm the gated specialization.
     output_gate_ptr = TritonWarmupTensor(
-        torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
+        q_ptr.dtype, shape=(num_rows, num_query_heads, head_dim)
     )
     head_stride = head_dim
     row_stride = num_query_heads * head_dim
