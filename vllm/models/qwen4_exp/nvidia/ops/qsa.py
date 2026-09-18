@@ -611,7 +611,7 @@ def qsa_sparse_paged_attention(
         softmax_scale = (head_dim**-0.5) * float(k_scale)
         output_scale = float(v_scale)
     else:
-        assert k_cache.dtype == torch.bfloat16
+        assert k_cache.dtype in (torch.float16, torch.bfloat16)
         softmax_scale = head_dim**-0.5
         output_scale = 1.0
     assert logical_indices.dtype == block_table.dtype == torch.int32
