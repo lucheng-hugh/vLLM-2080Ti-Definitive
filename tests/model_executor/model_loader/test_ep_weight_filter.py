@@ -8,6 +8,7 @@ import tempfile
 import huggingface_hub.constants
 import pytest
 import torch
+from safetensors.torch import load_file, save_file
 
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
@@ -278,8 +279,6 @@ class TestEpFilterOnSyntheticMoeWeights:
     @pytest.fixture
     def synthetic_moe_files(self, tmp_path):
         """Create synthetic safetensors with expert-patterned tensor names."""
-        from safetensors.torch import save_file
-
         tensors = {}
         # Dense weights
         tensors["model.embed_tokens.weight"] = torch.randn(100, 64)
@@ -374,3 +373,43 @@ class TestEpFilterOnSyntheticMoeWeights:
 
         for name, tensor in filtered.items():
             assert torch.equal(tensor, all_weights[name]), f"Tensor mismatch for {name}"
+
+
+def test_safetensors_iterator_retries_storage_shape_failure(tmp_path, monkeypatch):
+    """A transient safetensors storage failure falls back per checkpoint file."""
+    from vllm.model_executor.model_loader import weight_utils
+
+    path = tmp_path / "weights.safetensors"
+    expected = {"weight": torch.randn(8, 8), "scale": torch.ones(())}
+    save_file(expected, str(path))
+    real_safe_open = weight_utils.safe_open
+
+    class FlakySafeOpen:
+        def __init__(self):
+            self._ctx = real_safe_open(str(path), framework="pt")
+            self._failed = False
+
+        def __enter__(self):
+            self._ctx.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._ctx.__exit__(*args)
+
+        def keys(self):
+            return self._ctx.keys()
+
+        def get_tensor(self, name):
+            if not self._failed:
+                self._failed = True
+                raise ValueError(
+                    "could not determine the shape of object type "
+                    "'torch.storage.UntypedStorage'"
+                )
+            return self._ctx.get_tensor(name)
+
+    monkeypatch.setattr(weight_utils, "safe_open", lambda *args, **kwargs: FlakySafeOpen())
+    loaded = dict(weight_utils.safetensors_weights_iterator([str(path)], False))
+    assert loaded.keys() == expected.keys()
+    for name, tensor in expected.items():
+        assert torch.equal(loaded[name], tensor)

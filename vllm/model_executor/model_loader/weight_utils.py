@@ -993,10 +993,23 @@ def safetensors_weights_iterator(
             yield from unflattened_state_dict.items()
         else:
             with safe_open(st_file, framework="pt") as f:
+                fallback_state_dict: dict[str, torch.Tensor] | None = None
                 for name in f.keys():  # noqa: SIM118
                     if should_skip_weight(name, local_expert_ids):
                         continue
-                    param = f.get_tensor(name)
+                    try:
+                        param = f.get_tensor(name)
+                    except ValueError as exc:
+                        # Some older safetensors/torch combinations can fail
+                        # to materialize a storage from a concurrently opened
+                        # NVFP4 shard. Retry that file through the same eager
+                        # decoder used by the explicit eager strategy.
+                        if "could not determine the shape" not in str(exc):
+                            raise
+                        if fallback_state_dict is None:
+                            with open(st_file, "rb") as shard:
+                                fallback_state_dict = load(shard.read())
+                        param = fallback_state_dict[name]
                     yield name, param
 
 
