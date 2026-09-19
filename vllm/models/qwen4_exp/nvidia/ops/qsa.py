@@ -144,10 +144,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
-        if IS_FP8:
-            # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (fp8 QK
-            # measured slower here and less accurate).
-            keys = keys.to(query.dtype)
+        # Triton requires matching operand dtypes for tl.dot. FP16 queries
+        # are used with both BF16 and FP8-e4m3 caches on Turing; convert the
+        # loaded key tile before the dot.
+        keys = keys.to(query.dtype)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16; for fp8
         # caches the K dequant scale is already folded into softmax_scale on the
