@@ -53,6 +53,62 @@ from .ops.ple import ple_ngram_ids
 logger = init_logger(__name__)
 
 
+def _compute_ngram_ids_cpu(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    layer_multipliers: torch.Tensor,
+    ngram_heads_vocab_sizes: torch.Tensor,
+    ngram_heads_offsets: torch.Tensor,
+    eos_token_id: int,
+    heads_per_ngram: int,
+    ngram_size: int,
+) -> torch.Tensor:
+    """Build PLE IDs on CPU for the disk-backed request path."""
+    input_ids = input_ids.reshape(-1).long()
+    query_start_loc = query_start_loc.long()
+    num_reqs = query_start_loc.numel() - 1
+    num_tokens = input_ids.shape[0]
+    positions = torch.arange(num_tokens, device="cpu", dtype=torch.int64)
+    packed = torch.full(
+        (num_reqs, num_tokens), eos_token_id, device="cpu", dtype=torch.int64
+    )
+    request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
+    request_indices.clamp_(max=num_reqs - 1)
+    columns = (positions - query_start_loc[request_indices]).clamp(
+        0, packed.shape[1] - 1
+    )
+    packed[request_indices, columns] = input_ids
+    context = torch.cat(
+        [ngram_context[:num_reqs].long().cpu(), packed], dim=-1
+    )
+    positions_2d, position_in_segment = Qwen4ExpNGramEmbedding._shift_precompute(
+        context, eos_token_id
+    )
+    shifted = [context]
+    for shift in range(1, ngram_size):
+        shifted.append(
+            Qwen4ExpNGramEmbedding._shift_apply(
+                context, positions_2d, position_in_segment, shift, eos_token_id
+            )
+        )
+    adjusted_columns = columns + ngram_size - 1
+    id_blocks = []
+    for ngram in range(2, ngram_size + 1):
+        start = (ngram - 2) * heads_per_ngram
+        end = start + heads_per_ngram
+        mixed = shifted[0] * layer_multipliers[0]
+        for index in range(1, ngram):
+            mixed = torch.bitwise_xor(
+                mixed, shifted[index] * layer_multipliers[index]
+            )
+        sizes = ngram_heads_vocab_sizes[start:end]
+        offsets = ngram_heads_offsets[start:end]
+        ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
+        id_blocks.append(ids[request_indices, adjusted_columns])
+    return torch.cat(id_blocks, dim=-1)
+
+
 class DiskMappedPLEEmbedding(nn.Module):
     """FP8 PLE shards retained as safetensors mappings on local storage.
 
@@ -109,6 +165,15 @@ class DiskMappedPLEEmbedding(nn.Module):
         self._prefetch_stream: torch.cuda.Stream | None = None
         self._prefetch_output: torch.Tensor | None = None
         self._prefetch_executor: ThreadPoolExecutor | None = None
+        self.ngram_size = 0
+        self.heads_per_ngram = 0
+        self.eos_token_id = 0
+        self.layer_multipliers: torch.Tensor | None = None
+        self.ngram_heads_vocab_sizes: torch.Tensor | None = None
+        self.ngram_heads_offsets: torch.Tensor | None = None
+        self._cpu_layer_multipliers: torch.Tensor | None = None
+        self._cpu_ngram_heads_vocab_sizes: torch.Tensor | None = None
+        self._cpu_ngram_heads_offsets: torch.Tensor | None = None
         key_prefixes = [key_prefix]
         if "language_model.model." in key_prefix:
             key_prefixes.append(
@@ -249,6 +314,62 @@ class DiskMappedPLEEmbedding(nn.Module):
                 output_gpu.copy_(output_cpu, non_blocking=True)
 
         self._prefetch_executor.submit(lookup_and_upload)
+
+    @eager_break_during_capture
+    def start_request_prefetch(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        """Compute n-gram IDs and gather mmap rows entirely on the CPU."""
+        if (
+            self._cpu_layer_multipliers is None
+            or self._cpu_ngram_heads_vocab_sizes is None
+            or self._cpu_ngram_heads_offsets is None
+        ):
+            raise RuntimeError("disk PLE request metadata was not configured")
+        if self._prefetch_stream is None:
+            self._prefetch_stream = torch.cuda.Stream(device=input_ids.device)
+        if self._prefetch_executor is None:
+            self._prefetch_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vllm-ple-disk"
+            )
+        ids_cpu = torch.empty_like(input_ids, device="cpu", pin_memory=True)
+        loc_cpu = torch.empty_like(query_start_loc, device="cpu", pin_memory=True)
+        ctx_cpu = torch.empty_like(ngram_context, device="cpu", pin_memory=True)
+        ids_cpu.copy_(input_ids, non_blocking=True)
+        loc_cpu.copy_(query_start_loc, non_blocking=True)
+        ctx_cpu.copy_(ngram_context, non_blocking=True)
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream())
+        num_heads = (self.ngram_size - 1) * self.heads_per_ngram
+        output_gpu = torch.empty(
+            (input_ids.shape[0], num_heads, self.embedding_dim),
+            dtype=self.weight_dtype,
+            device=input_ids.device,
+        )
+        self._prefetch_output = output_gpu
+        stream = self._prefetch_stream
+
+        def compute_lookup_and_upload() -> None:
+            ready.synchronize()
+            ngram_ids = _compute_ngram_ids_cpu(
+                ids_cpu,
+                loc_cpu,
+                ctx_cpu,
+                self._cpu_layer_multipliers,
+                self._cpu_ngram_heads_vocab_sizes,
+                self._cpu_ngram_heads_offsets,
+                self.eos_token_id,
+                self.heads_per_ngram,
+                self.ngram_size,
+            )
+            output_cpu = self.lookup(ngram_ids)
+            with torch.cuda.stream(stream):
+                output_gpu.copy_(output_cpu, non_blocking=True)
+
+        self._prefetch_executor.submit(compute_lookup_and_upload)
 
     @eager_break_during_capture
     def finish_prefetch(self, num_tokens: int) -> torch.Tensor:
@@ -951,6 +1072,23 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 self.split_ngram_parts,
                 params_dtype,
             )
+            self.ngram_embedding.ngram_size = self.ngram_size
+            self.ngram_embedding.heads_per_ngram = self.heads_per_ngram
+            self.ngram_embedding.eos_token_id = self.eos_token_id
+            self.ngram_embedding.layer_multipliers = self.layer_multipliers
+            self.ngram_embedding.ngram_heads_vocab_sizes = (
+                self.ngram_heads_vocab_sizes
+            )
+            self.ngram_embedding.ngram_heads_offsets = self.ngram_heads_offsets
+            self.ngram_embedding._cpu_layer_multipliers = (
+                self.layer_multipliers.detach().cpu()
+            )
+            self.ngram_embedding._cpu_ngram_heads_vocab_sizes = (
+                self.ngram_heads_vocab_sizes.detach().cpu()
+            )
+            self.ngram_embedding._cpu_ngram_heads_offsets = (
+                self.ngram_heads_offsets.detach().cpu()
+            )
         else:
             embedding_cls = (
                 Qwen4ExpPLEPinnedHostEmbedding
@@ -1114,6 +1252,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> None:
         """Start the pinned lookup while the preceding decoder layer runs."""
         embedding = self.ngram_embedding
+        if getattr(embedding, "is_disk_mapped", False):
+            embedding.start_request_prefetch(
+                input_ids, query_start_loc, ngram_context
+            )
+            return
         if not embedding.supports_prefetch:
             return
         ngram_ids = self.compute_ngram_ids(
