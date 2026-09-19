@@ -6,8 +6,15 @@ import pytest
 import torch
 
 from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
+from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionBackend
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
+
+
+def test_qsa_accepts_fp16_kv_cache() -> None:
+    """The SM75 QSA route must retain the historical FP16 KV option."""
+    assert "float16" in Qwen4ExpQSAFlashAttentionBackend.supported_kv_cache_dtypes
+    assert Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("float16")
 
 
 @pytest.mark.skipif(
