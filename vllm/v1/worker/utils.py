@@ -457,13 +457,21 @@ def allocate_kv_cache(
     buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
 
     kv_caches: dict[str, torch.Tensor] = {}
+    layer_to_group = {
+        layer_name: (group_id, group)
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+        for layer_name in group.layer_names
+    }
     for tensor in kv_cache_config.kv_cache_tensors:
         layer_name = tensor.layers[0]
-        group_id, group = next(
-            (group_id, group)
-            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
-            if layer_name in group.layer_names
-        )
+        group_entry = layer_to_group.get(layer_name)
+        if group_entry is None:
+            raise ValueError(
+                "KV cache tensor contains a layer absent from this worker's "
+                f"cache groups: layer={layer_name!r}, tensor_layers={tensor.layers!r}, "
+                f"group_layers={[group.layer_names for group in kv_cache_config.kv_cache_groups]!r}"
+            )
+        group_id, group = group_entry
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
             spec = spec.kv_cache_specs[layer_name]
