@@ -165,13 +165,23 @@ class DiskMappedPLEEmbedding(nn.Module):
         input_shape = tuple(indices.shape)
         flat_source = indices.reshape(-1)
         flat = torch.empty(flat_source.numel(), dtype=torch.long, pin_memory=True)
-        flat.copy_(flat_source, non_blocking=True)
+        # The CPU consumes these indices immediately to select mmap-backed
+        # rows, so an asynchronous D2H copy would race that lookup.
+        flat.copy_(flat_source, non_blocking=False)
         output = torch.empty(
             (flat.numel(), self.embedding_dim),
             dtype=self.weight_dtype,
             pin_memory=True,
         )
         if flat.numel():
+            min_index = int(flat.min())
+            max_index = int(flat.max())
+            if min_index < 0 or max_index >= self.org_vocab_size:
+                raise IndexError(
+                    "PLE embedding index out of range: "
+                    f"min={min_index}, max={max_index}, "
+                    f"num_embeddings={self.org_vocab_size}"
+                )
             shard_ids = torch.div(flat, self._shard_size, rounding_mode="floor")
             for shard_index in torch.unique(shard_ids, sorted=True).tolist():
                 mask = shard_ids == shard_index
