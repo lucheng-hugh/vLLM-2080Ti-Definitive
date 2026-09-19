@@ -147,10 +147,13 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
     ) -> torch.Tensor:
         """Dequantize PLE lookup output."""
 
-        return self.ple_embedding.ngram_embedding.dequantize(
-            embeddings,
-            output_dtype,
-        )
+        embedding = getattr(self.ple_embedding, "ngram_embedding", None)
+        if embedding is None:
+            # Request-level PLE offload returns rows already converted to the
+            # model dtype; the GPU placeholder intentionally has no embedding
+            # table or quantization method.
+            return embeddings.to(output_dtype)
+        return embedding.dequantize(embeddings, output_dtype)
 
     def start_prefetch(
         self,

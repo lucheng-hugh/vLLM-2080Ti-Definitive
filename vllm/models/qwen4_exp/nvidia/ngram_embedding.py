@@ -34,6 +34,10 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
+from vllm.model_executor.layers.ple_offload_layer import (
+    PleOffloadLayer,
+    is_offload_process,
+)
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.parameter import (
     ModelWeightParameter,
@@ -887,7 +891,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         return output
 
 
-class Qwen4ExpNGramEmbedding(nn.Module):
+class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     _MASK64 = (1 << 64) - 1
     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
     _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
@@ -1080,14 +1084,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 self.ngram_heads_vocab_sizes
             )
             self.ngram_embedding.ngram_heads_offsets = self.ngram_heads_offsets
-            self.ngram_embedding._cpu_layer_multipliers = (
-                self.layer_multipliers.detach().cpu()
+            # The request-level PLE worker discovers layers under a meta-device
+            # context. Build its disk lookup metadata from the source values so
+            # initialization does not attempt to copy unmaterialized buffers.
+            self.ngram_embedding._cpu_layer_multipliers = torch.tensor(
+                multipliers, dtype=torch.long
             )
-            self.ngram_embedding._cpu_ngram_heads_vocab_sizes = (
-                self.ngram_heads_vocab_sizes.detach().cpu()
+            self.ngram_embedding._cpu_ngram_heads_vocab_sizes = torch.tensor(
+                sizes, dtype=torch.long
             )
-            self.ngram_embedding._cpu_ngram_heads_offsets = (
-                self.ngram_heads_offsets.detach().cpu()
+            self.ngram_embedding._cpu_ngram_heads_offsets = torch.tensor(
+                offsets, dtype=torch.long
             )
         else:
             embedding_cls = (
@@ -1230,17 +1237,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             id_blocks.append(ids[request_indices, adjusted_columns])
         return torch.cat(id_blocks, dim=-1)
 
-    def forward(
+    def forward_impl(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         embedding = self.ngram_embedding
         if embedding.supports_prefetch:
             return embedding(hidden_states)
-        ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+        ngram_ids = self.compute_ngram_ids(
+            input_ids, query_start_loc, ngram_context, output=output_buffer
+        )
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
     def start_prefetch(
@@ -1251,6 +1261,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_context: torch.Tensor,
     ) -> None:
         """Start the pinned lookup while the preceding decoder layer runs."""
+        if getattr(self, "_is_cpu_offloaded", False):
+            return
         embedding = self.ngram_embedding
         if getattr(embedding, "is_disk_mapped", False):
             embedding.start_request_prefetch(
@@ -1268,6 +1280,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
+
+        if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
+            return set()
 
         persistent_buffers = {
             "layer_multipliers": self.layer_multipliers,

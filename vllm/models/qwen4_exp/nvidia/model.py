@@ -24,6 +24,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.ple_offload_layer import (
+    PleOffloadLayer,
+    is_offload_process,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -612,11 +616,17 @@ class Qwen4ExpModel(nn.Module):
         )
         # The final HC mixer only exists on the last PP rank; earlier ranks
         # must drop its checkpoint weights instead of failing to place them.
-        ignore_prefixes = (
-            None
-            if self.hyper_connection_mixer is not None
-            else ["hyper_connection_mixer."]
-        )
+        ignore_prefixes = []
+        if self.hyper_connection_mixer is None:
+            ignore_prefixes.append("hyper_connection_mixer.")
+        if not is_offload_process():
+            ignore_prefixes.extend(
+                f"{name}."
+                for name, module in self.named_modules()
+                if isinstance(module, PleOffloadLayer)
+                and not tuple(module.parameters())
+                and not tuple(module.buffers())
+            )
         loader = AutoWeightsLoader(
             self,
             ignore_unexpected_prefixes=ignore_prefixes,

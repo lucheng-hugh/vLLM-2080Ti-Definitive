@@ -175,6 +175,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_PLE_CPU_OFFLOAD: bool = True
+    VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
     VLLM_PLE_PLACEMENT: Literal["auto", "disk", "cpu", "gpu"] = "auto"
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
@@ -2159,6 +2160,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Store n-gram embedding tables in pinned CPU memory for UVA lookup.
     "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "1"))),
+    "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
+        os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
+    ),
     "VLLM_PLE_PLACEMENT": lambda: _get_ple_placement(),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(

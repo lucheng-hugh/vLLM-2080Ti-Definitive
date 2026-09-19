@@ -44,6 +44,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
 )
+from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -116,6 +117,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
+from vllm.v1.ple_offload.connector import PleOffloadConnector
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
@@ -343,6 +345,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
+        self._ple_offload_connector: PleOffloadConnector | None = None
 
         # LoRA-related workers.
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
@@ -367,6 +370,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         self.req_states.max_model_len = max_model_len
+
+    def _setup_ple_offload(self, ipc_addr: str) -> bool:
+        """Bind local PLE placeholders to the node-local CPU worker."""
+        if not any(
+            isinstance(module, PleOffloadLayer) for module in self.model.modules()
+        ):
+            return False
+        query_start_loc = self.input_buffers.query_start_loc
+        ngram_context = getattr(self.model_state, "ngram_context", None)
+        if not isinstance(ngram_context, torch.Tensor):
+            raise RuntimeError("PLE offload requires a model-state ngram_context")
+        self._ple_offload_connector = PleOffloadConnector(
+            self.vllm_config,
+            self.model,
+            self.device,
+            ipc_addr,
+            input_ids_source=self.input_buffers.input_ids,
+            query_start_loc_source=query_start_loc,
+            ngram_context_source=ngram_context,
+        )
+        return True
 
     def init_routed_experts_capturer(self) -> None:
         """Initialize target-model capture on every participating worker."""
@@ -1927,6 +1951,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens=input_batch.num_tokens,
         )
 
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.prepare_forward(
+                input_batch.num_reqs,
+                input_batch.num_tokens_after_padding,
+                dummy_run,
+            )
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1996,6 +2027,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.release_outputs()
         self.kv_connector.finish_forward()
 
         if self.is_last_pp_rank:

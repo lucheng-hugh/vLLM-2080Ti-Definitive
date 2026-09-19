@@ -222,11 +222,65 @@ class Worker(WorkerBase):
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
 
+        self._ple_offload_worker_handle: Any | None = None
+        self._ple_offload_enabled = self._has_ple_layers()
+
         # Device handles of the previous step's PP intermediate-tensor send.
         self._pp_send_work: list[Handle] = []
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
+
+    def _has_ple_layers(self) -> bool:
+        text_config = self.model_config.hf_text_config
+        return bool(
+            envs.VLLM_PLE_CPU_OFFLOAD
+            and envs.VLLM_PLE_PLACEMENT in {"disk", "auto"}
+            and getattr(text_config, "ple_layer_ids", None)
+        )
+
+    def spawn_ple_offload(self) -> None:
+        if (
+            not self._ple_offload_enabled
+            or self.rank != 0
+            or self.parallel_config.data_parallel_rank != 0
+        ):
+            return
+        from vllm.distributed.utils import get_pp_indices
+        from vllm.v1.ple_offload.worker import PleOffloadWorker
+
+        text_config = self.model_config.hf_text_config
+        pp_size = self.parallel_config.pipeline_parallel_size
+        ple_stage_count = sum(
+            any(
+                start <= int(layer_id) - 1 < end
+                for layer_id in text_config.ple_layer_ids
+            )
+            for start, end in (
+                get_pp_indices(text_config.num_hidden_layers, pp_rank, pp_size)
+                for pp_rank in range(pp_size)
+            )
+        )
+        if ple_stage_count == 0:
+            raise RuntimeError("PLE layer IDs do not belong to a pipeline stage")
+        ipc_addr = self.parallel_config._ple_offload_ipc_path
+        if not ipc_addr:
+            raise RuntimeError("PLE offload IPC address was not initialized")
+        num_workers = (
+            self.parallel_config.data_parallel_size
+            * self.parallel_config.tensor_parallel_size
+            * ple_stage_count
+        )
+        self._ple_offload_worker_handle = PleOffloadWorker.make_process(
+            self.vllm_config, num_workers, ipc_addr
+        )
+
+    def wait_ple_offload_ready(self) -> None:
+        if self._ple_offload_worker_handle is None:
+            return
+        from vllm.v1.ple_offload.worker import PleOffloadWorker
+
+        PleOffloadWorker.wait_for_ready(self._ple_offload_worker_handle)
 
     @property
     def sleep_mode_backend(self) -> "SleepModeBackend":
@@ -496,6 +550,8 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        if self._ple_offload_enabled:
+            self.spawn_ple_offload()
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
@@ -503,6 +559,12 @@ class Worker(WorkerBase):
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+
+        if self._ple_offload_enabled:
+            self.model_runner._setup_ple_offload(
+                self.parallel_config._ple_offload_ipc_path
+            )
+            self.wait_ple_offload_ready()
 
         if has_ec_transfer():
             get_ec_transfer().start_worker_services()
@@ -1517,6 +1579,10 @@ class Worker(WorkerBase):
             weight_transfer_engine.shutdown()
 
         self.elastic_ep_executor.shutdown()
+
+        if self._ple_offload_worker_handle is not None:
+            self._ple_offload_worker_handle.close()
+            self._ple_offload_worker_handle = None
 
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process
