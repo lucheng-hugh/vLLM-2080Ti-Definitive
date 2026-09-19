@@ -585,6 +585,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # GPUWorker finalizes the PD interleave before KV cache initialization.
         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
         kv_cache_config = deepcopy(kv_cache_config)
+        local_layer_names = {
+            layer_name
+            for group in kv_cache_config.kv_cache_groups
+            for layer_name in group.layer_names
+        }
+        local_tensors = []
+        for tensor in kv_cache_config.kv_cache_tensors:
+            owned_layers = local_layer_names.intersection(tensor.layers)
+            if not owned_layers:
+                continue
+            if len(owned_layers) != len(tensor.layers):
+                raise ValueError(
+                    "A pipeline KV cache tensor mixes local and non-local layers: "
+                    f"tensor_layers={tensor.layers!r}, local_layers={sorted(owned_layers)!r}"
+                )
+            local_tensors.append(tensor)
+        kv_cache_config.kv_cache_tensors = local_tensors
         self.kv_cache_config = kv_cache_config
 
         block_table_max_model_len = self.max_model_len
