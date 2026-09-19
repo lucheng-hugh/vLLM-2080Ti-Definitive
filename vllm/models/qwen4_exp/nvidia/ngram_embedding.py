@@ -3,6 +3,7 @@
 """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from pathlib import Path
@@ -61,7 +62,10 @@ class DiskMappedPLEEmbedding(nn.Module):
     """
 
     is_disk_mapped = True
-    supports_prefetch = False
+    # Disk lookup is CPU-bound, but the GPU-generated IDs and the resulting
+    # rows can be transported on separate CUDA streams. This keeps mmap row
+    # selection off the model's critical stream during decode.
+    supports_prefetch = True
 
     def __init__(
         self,
@@ -102,6 +106,9 @@ class DiskMappedPLEEmbedding(nn.Module):
         ) // split_ngram_parts
         self._shards: dict[int, torch.Tensor] = {}
         self._handles: dict[str, Any] = {}
+        self._prefetch_stream: torch.cuda.Stream | None = None
+        self._prefetch_output: torch.Tensor | None = None
+        self._prefetch_executor: ThreadPoolExecutor | None = None
         key_prefixes = [key_prefix]
         if "language_model.model." in key_prefix:
             key_prefixes.append(
@@ -192,7 +199,66 @@ class DiskMappedPLEEmbedding(nn.Module):
         )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        if self._prefetch_output is not None and indices.is_cuda:
+            return self.finish_prefetch(indices.shape[0])
         return self.lookup(indices)
+
+    @eager_break_during_capture
+    def start_prefetch(
+        self,
+        hidden_states: torch.Tensor,
+        ngram_ids: torch.Tensor,
+    ) -> None:
+        """Overlap mmap lookup with the preceding decoder-layer compute."""
+        del hidden_states
+        if not ngram_ids.is_cuda:
+            raise RuntimeError("disk PLE prefetch requires CUDA n-gram IDs")
+        if self._prefetch_stream is None:
+            self._prefetch_stream = torch.cuda.Stream(device=ngram_ids.device)
+        if self._prefetch_executor is None:
+            self._prefetch_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="vllm-ple-disk",
+            )
+
+        # The copy is ordered after ID production on the model stream. The
+        # worker thread waits on this event before touching the pinned tensor,
+        # avoiding the race fixed in 710220c0cb while allowing CPU lookup to
+        # proceed independently of later GPU layers.
+        ids_cpu = torch.empty(
+            ngram_ids.shape,
+            dtype=ngram_ids.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        ids_cpu.copy_(ngram_ids, non_blocking=True)
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream())
+        output_gpu = torch.empty(
+            (*ngram_ids.shape, self.embedding_dim),
+            dtype=self.weight_dtype,
+            device=ngram_ids.device,
+        )
+        self._prefetch_output = output_gpu
+        stream = self._prefetch_stream
+
+        def lookup_and_upload() -> None:
+            ready.synchronize()
+            output_cpu = self.lookup(ids_cpu)
+            with torch.cuda.stream(stream):
+                output_gpu.copy_(output_cpu, non_blocking=True)
+
+        self._prefetch_executor.submit(lookup_and_upload)
+
+    @eager_break_during_capture
+    def finish_prefetch(self, num_tokens: int) -> torch.Tensor:
+        """Join the side-stream H2D copy and return the requested rows."""
+        if self._prefetch_stream is None or self._prefetch_output is None:
+            raise RuntimeError("disk PLE prefetch was not started")
+        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        output = self._prefetch_output[:num_tokens]
+        self._prefetch_output = None
+        return output.flatten(-2)
 
     def dequantize(
         self, embeddings: torch.Tensor, output_dtype: torch.dtype
@@ -206,6 +272,11 @@ class DiskMappedPLEEmbedding(nn.Module):
     def close(self) -> None:
         self._shards.clear()
         self._handles.clear()
+        if self._prefetch_executor is not None:
+            self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
+            self._prefetch_executor = None
+        self._prefetch_output = None
+        self._prefetch_stream = None
 
     def __del__(self) -> None:
         if hasattr(self, "_shards"):
