@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from dataclasses import dataclass
 from functools import partial
 from itertools import accumulate
@@ -25,6 +26,7 @@ from vllm.models.qwen4_exp.common.ple import (
     copy_ple_embedding_shard_,
 )
 from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
+    DiskMappedPLEEmbedding,
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLEDeviceEmbedding,
     Qwen4ExpPLEEmbeddingMethod,
@@ -32,6 +34,89 @@ from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
     Qwen4ExpPLEPinnedHostEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pin-memory")
+def test_disk_mapped_ple_lookup_reads_all_safetensor_shards(tmp_path) -> None:
+    """Disk placement gathers rows across shards and preserves request shape."""
+    from safetensors.torch import save_file
+
+    root = tmp_path
+    names = [
+        "model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight",
+        "model.layers.0.ple.ple_embedding.ngram_embedding.shard_1.weight",
+    ]
+    scale_name = "model.layers.0.ple.ple_embedding.ngram_embedding.weight_scale"
+    checkpoint = root / "model.safetensors"
+    save_file(
+        {
+            names[0]: torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+            names[1]: torch.tensor([[7, 8], [9, 10]], dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+            scale_name: torch.tensor([0.25], dtype=torch.float32),
+        },
+        str(checkpoint),
+    )
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {name: checkpoint.name for name in [*names, scale_name]}}
+        )
+    )
+    embedding = DiskMappedPLEEmbedding(
+        str(root),
+        names[0].rsplit(".shard_0.weight", 1)[0],
+        num_embeddings=5,
+        embedding_dim=2,
+        split_ngram_parts=2,
+        params_dtype=torch.bfloat16,
+    )
+    ids = torch.tensor([[4, 0], [3, 2]], device="cuda")
+    output = embedding.lookup(ids)
+    expected = torch.tensor([[9, 10], [1, 2], [7, 8], [5, 6]], device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    assert output.shape == (2, 2, 2)
+    torch.testing.assert_close(output.reshape(-1, 2).float(), expected.float())
+    torch.testing.assert_close(
+        embedding.dequantize(output, torch.bfloat16),
+        expected.to(torch.bfloat16).reshape(2, 2, 2) * 0.25,
+    )
+    embedding.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pin-memory")
+def test_disk_mapped_ple_lookup_rejects_out_of_range_indices(tmp_path) -> None:
+    from safetensors.torch import save_file
+
+    root = tmp_path
+    names = [
+        "model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight",
+        "model.layers.0.ple.ple_embedding.ngram_embedding.shard_1.weight",
+    ]
+    checkpoint = root / "model.safetensors"
+    save_file(
+        {
+            name: torch.zeros((rows, 1), dtype=torch.float8_e4m3fn)
+            for name, rows in zip(names, (2, 1), strict=True)
+        },
+        str(checkpoint),
+    )
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: checkpoint.name for name in names}})
+    )
+    embedding = DiskMappedPLEEmbedding(
+        str(root),
+        "model.layers.0.ple.ple_embedding.ngram_embedding",
+        3,
+        1,
+        2,
+        torch.bfloat16,
+    )
+    with pytest.raises(IndexError, match="out of range"):
+        embedding.lookup(torch.tensor([3], device="cuda"))
 from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLELayer
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadata,
