@@ -547,11 +547,11 @@ def _select_config(
         BLOCK_N, target_splits, num_warps = 64, 4, 2
     else:
         BLOCK_N, target_splits, num_warps = 64, 1, 2
-    if is_pre_ampere and BLOCK_N == 64:
-        # SM75 has a 64 KiB shared-memory limit. The 64-column, 256-wide
-        # profile used on newer GPUs can exceed it, so narrow the tile and
-        # expose four warps before deriving the split count.
-        BLOCK_N, num_warps = 16, 4
+    if is_pre_ampere:
+        # SM75 has a 64 KiB shared-memory limit. The small-query branches can
+        # otherwise select 32 columns and up to 64 warps, which overcommits
+        # shared memory/registers in TP4 decode and fails at kernel launch.
+        BLOCK_N, num_warps = min(BLOCK_N, 16), min(num_warps, 4)
     num_tiles = triton.cdiv(num_columns, BLOCK_N)
     # Never more splits than tiles, never empty.
     num_splits = min(target_splits, num_tiles)
